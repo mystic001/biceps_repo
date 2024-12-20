@@ -1,0 +1,162 @@
+name: Deploy Azure Resources
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+    paths:
+      - '**.bicep'
+      - '**.json'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - production
+
+jobs:
+  determine_environment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set_env.outputs.environment }}
+    steps:
+      - name: Set environment based on branch
+        id: set_env
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=development" >> $GITHUB_OUTPUT
+          fi
+
+  validate:
+    needs: determine_environment
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine_environment.outputs.environment }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Validate Bicep files
+        uses: azure/arm-deploy@v1
+        with:
+          scope: subscription
+          subscriptionId: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          region: ${{ secrets.AZURE_REGION }}
+          template: ./main.bicep
+          deploymentMode: Validate
+          parameters: '@parameters/${{ needs.determine_environment.outputs.environment }}.json'
+
+  deploy:
+    needs: [determine_environment, validate]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine_environment.outputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Bicep files
+        uses: azure/arm-deploy@v1
+        with:
+          scope: subscription
+          subscriptionId: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          region: ${{ secrets.AZURE_REGION }}
+          template: ./main.bicep
+          parameters: '@parameters/${{ needs.determine_environment.outputs.environment }}.json'
+
+  create_pr:
+    needs: [deploy]
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Debug Branch Info
+        run: |
+          echo "Current branch: ${{ github.ref }}"
+          echo "Base branch: main"
+          git branch
+          git status
+          git log --oneline -n 5
+
+      - name: Check for existing PR
+        id: check_pr
+        run: |
+          # List all current PRs for debugging
+          echo "Current PRs from dev to main:"
+          gh pr list --base main --head dev
+          
+          # Get count of PRs
+          PR_COUNT=$(gh pr list --base main --head dev --json number --jq length || echo "0")
+          echo "Found $PR_COUNT existing PRs"
+          echo "pr_exists=$PR_COUNT" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Try creating PR with GitHub CLI without labels
+      - name: Create Pull Request with GitHub CLI
+        if: steps.check_pr.outputs.pr_exists == '0'
+        id: create-pr-cli
+        run: |
+          echo "Attempting to create PR..."
+          PR_URL=$(gh pr create \
+            --base main \
+            --head dev \
+            --title "Promote Development to Production" \
+            --body "This PR was automatically created to promote changes from development to production.")
+          
+          if [ $? -eq 0 ]; then
+            echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+            echo "PR created successfully: $PR_URL"
+          else
+            echo "Failed to create PR. Error: $?"
+            gh pr list --base main --head dev
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: PR Status
+        run: |
+          echo "PR Check Value: ${{ steps.check_pr.outputs.pr_exists }}"
+          echo "PR URL: ${{ steps.create-pr-cli.outputs.pr_url }}"
+          
+          if [[ "${{ steps.check_pr.outputs.pr_exists }}" == "0" ]]; then
+            if [[ -n "${{ steps.create-pr-cli.outputs.pr_url }}" ]]; then
+              echo "New pull request created successfully"
+              echo "PR URL: ${{ steps.create-pr-cli.outputs.pr_url }}"
+            else
+              echo "Failed to create PR. Checking for differences..."
+              git diff origin/main...origin/dev
+              echo "Branch status:"
+              git branch -v
+            fi
+          else
+            echo "Pull request already exists from dev to main. Skipping PR creation."
+            echo "Existing PRs:"
+            gh pr list --base main --head dev
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
